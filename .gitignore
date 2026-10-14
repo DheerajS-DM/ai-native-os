@@ -1,0 +1,26 @@
+# Binaries and compiled objects
+allocator
+*.o
+*.so
+*.exe
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Local databases and logs
+*.db
+*.log
+/tmp/antigravity.sock
+/tmp/nexus.sock
+
+# OS & Editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+nul

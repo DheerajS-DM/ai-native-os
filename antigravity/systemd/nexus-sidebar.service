@@ -1,0 +1,19 @@
+[Unit]
+Description=Nexus PyQt6 desktop sidebar
+After=nexus-agent.service
+Requires=nexus-agent.service
+
+[Service]
+Type=simple
+Environment=DISPLAY=:10.0
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+ExecStart=/usr/bin/python3 %h/nexus/sidebar.py
+ExecStartPost=/bin/sh -c 'echo $MAINPID > /sys/fs/cgroup/nexus/cgroup.procs 2>/dev/null || true'
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal+console
+StandardError=journal+console
+SyslogIdentifier=nexus-sidebar
+
+[Install]
+WantedBy=default.target

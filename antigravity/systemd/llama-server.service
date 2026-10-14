@@ -1,0 +1,20 @@
+[Unit]
+Description=Gemma-3n-E2B llama.cpp server (CUDA accelerated)
+After=allocator.service
+Requires=allocator.service
+
+[Service]
+Type=simple
+ExecStart=%h/llama.cpp/build/bin/llama-server \
+    --model %h/models/gemma-3n-e2b-it-q4_k_m.gguf \
+    --host 127.0.0.1 --port 8080 \
+    --ctx-size 8192 --threads 4 --n-gpu-layers 99 --metrics
+ExecStartPost=/bin/sh -c 'echo $MAINPID > /sys/fs/cgroup/nexus/cgroup.procs 2>/dev/null || true'
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal+console
+StandardError=journal+console
+SyslogIdentifier=nexus-llama
+
+[Install]
+WantedBy=default.target

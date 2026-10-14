@@ -1,0 +1,17 @@
+[Unit]
+Description=Nexus agent (Unix socket server)
+After=llama-server.service
+Requires=llama-server.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/nexus/socket_server.py
+ExecStartPost=/bin/sh -c 'echo $MAINPID > /sys/fs/cgroup/nexus/cgroup.procs 2>/dev/null || true'
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal+console
+StandardError=journal+console
+SyslogIdentifier=nexus-agent
+
+[Install]
+WantedBy=default.target

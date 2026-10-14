@@ -1,0 +1,14 @@
+[Unit]
+Description=Nexus cgroup allocator
+Documentation=https://github.com/dheeraj-dhruv/ai-native-os
+
+[Service]
+Type=oneshot
+ExecStart=%h/nexus/allocator
+RemainAfterExit=yes
+StandardOutput=journal+console
+StandardError=journal+console
+SyslogIdentifier=nexus-allocator
+
+[Install]
+WantedBy=default.target
