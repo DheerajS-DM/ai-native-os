@@ -48,8 +48,19 @@ static int write_file(const char *path, const char *content) {
     return 0;
 }
 
-int main(void) {
-    log_msg("INFO", "Starting Nexus Cgroup Allocator (PID: %d, UID: %d, GID: %d)", getpid(), getuid(), getgid());
+int main(int argc, char *argv[]) {
+    int target_pct = 70;
+    if (argc > 1) {
+        int parsed = atoi(argv[1]);
+        if (parsed >= 10 && parsed <= 95) {
+            target_pct = parsed;
+        } else {
+            log_msg("WARNING", "Invalid percentage '%s' provided (must be 10-95). Defaulting to 70%%.", argv[1]);
+        }
+    }
+
+    log_msg("INFO", "Starting Nexus Cgroup Allocator (PID: %d, UID: %d, GID: %d, Target: %d%%)",
+            getpid(), getuid(), getgid(), target_pct);
 
     struct sysinfo info;
     if (sysinfo(&info) != 0) {
@@ -61,15 +72,15 @@ int main(void) {
     long free_ram = (long)info.freeram * info.mem_unit;
     log_msg("INFO", "Host System Memory: Total = %ld MB, Free = %ld MB", total / (1024 * 1024), free_ram / (1024 * 1024));
 
-    long limit_70  = (long)(total * 0.70);
+    long limit_pct = (long)(total * (target_pct / 100.0));
     long limit_res = total - FOUR_GB;
-    long limit     = (limit_70 < limit_res) ? limit_70 : limit_res;
+    long limit     = (limit_pct < limit_res) ? limit_pct : limit_res;
     if (limit <= 0) {
         limit = total / 3;
     }
 
-    log_msg("INFO", "Calculated limits: 70%% = %ld MB, Floor reserved = %ld MB, Selected max = %ld MB (%.1f GB)",
-            limit_70 / (1024 * 1024), limit_res / (1024 * 1024), limit / (1024 * 1024), limit / 1073741824.0);
+    log_msg("INFO", "Calculated limits: %d%% = %ld MB, Floor reserved = %ld MB, Selected max = %ld MB (%.1f GB)",
+            target_pct, limit_pct / (1024 * 1024), limit_res / (1024 * 1024), limit / (1024 * 1024), limit / 1073741824.0);
 
     if (mkdir(CGROUP_PATH, 0755) != 0 && errno != EEXIST) {
         log_msg("WARNING", "mkdir(%s) failed: %s (errno: %d)", CGROUP_PATH, strerror(errno), errno);
@@ -77,10 +88,11 @@ int main(void) {
         log_msg("INFO", "Cgroup directory ready: %s", CGROUP_PATH);
     }
 
+    /* Assign ownership to user dheeraj (UID 1000, GID 1000) */
     chown(CGROUP_PATH, 1000, 1000);
     chown(CGROUP_PATH "/cgroup.procs", 1000, 1000);
     chown(CGROUP_PATH "/cgroup.threads", 1000, 1000);
-    log_msg("DEBUG", "Updated ownership (1000:1000) on cgroup nodes");
+    chmod(CGROUP_PATH "/cgroup.procs", 0666);
 
     char buf[64];
     snprintf(buf, sizeof(buf), "%ld", limit);
@@ -93,9 +105,11 @@ int main(void) {
     snprintf(buf, sizeof(buf), "%ld", high);
     write_file(CGROUP_PATH "/memory.high", buf);
 
-    /* In cgroup v2, a cgroup holding processes (leaf) must NOT have controllers
-       enabled in its own cgroup.subtree_control (the "no internal process" rule).
-       The parent /sys/fs/cgroup already delegates memory and pids to this cgroup. */
+    chown(CGROUP_PATH "/memory.max", 1000, 1000);
+    chown(CGROUP_PATH "/memory.high", 1000, 1000);
+    chmod(CGROUP_PATH "/memory.max", 0666);
+    chmod(CGROUP_PATH "/memory.high", 0666);
+    log_msg("DEBUG", "Configured user ownership (1000:1000) on cgroup memory limits");
 
     log_msg("INFO", "Nexus cgroup initialized successfully!");
     log_msg("INFO", "  Target path : %s", CGROUP_PATH);

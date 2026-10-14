@@ -104,6 +104,55 @@ class ClientHandler:
                     context.clear_conversation()
                     log.info("[Client #%d] Conversation history cleared", self.client_id)
                     await self.send({"type": "info", "text": "Conversation history cleared."})
+                elif msg_type == "direct_command":
+                    cmd = msg.get("command", "").strip()
+                    log.info("[Client #%d] Direct command execution requested: '%s'", self.client_id, cmd)
+                    from safeguard import check_command, Verdict
+                    from agent import _run_command
+
+                    verdict, reason = check_command(cmd, self.session.guard_state)
+                    log.info("[Client #%d] Direct command safeguard verdict: %s (%s)", self.client_id, verdict.value, reason)
+                    if verdict == Verdict.BLOCK:
+                        await self.send({"type": "blocked", "command": cmd, "reason": reason})
+                    elif verdict == Verdict.CONFIRM:
+                        await self.send({"type": "confirm", "command": cmd, "reason": reason})
+                        approved = await self.wait_confirm()
+                        if approved:
+                            await self.send({"type": "executing", "command": cmd})
+                            loop = asyncio.get_running_loop()
+                            out = await loop.run_in_executor(None, _run_command, cmd)
+                            await self.send({"type": "cmd_result", "command": cmd, "output": out})
+                        else:
+                            await self.send({"type": "info", "text": f"Command '{cmd}' cancelled by user."})
+                    else:
+                        await self.send({"type": "executing", "command": cmd})
+                        loop = asyncio.get_running_loop()
+                        out = await loop.run_in_executor(None, _run_command, cmd)
+                        await self.send({"type": "cmd_result", "command": cmd, "output": out})
+                elif msg_type == "set_cgroup":
+                    pct = int(msg.get("percent", 70))
+                    log.info("[Client #%d] Dynamic Cgroup reallocation requested: %d%%", self.client_id, pct)
+                    loop = asyncio.get_running_loop()
+                    try:
+                        import subprocess
+                        alloc_bin = str(Path(__file__).parent / "allocator")
+                        if not os.path.exists(alloc_bin):
+                            alloc_bin = "allocator"
+                        res = await loop.run_in_executor(
+                            None,
+                            lambda: subprocess.run([alloc_bin, str(pct)], capture_output=True, text=True, timeout=10)
+                        )
+                        if res.returncode == 0:
+                            msg_txt = f"Cgroups v2 limit updated to {pct}% RAM ceiling."
+                            log.info(msg_txt)
+                            await self.send({"type": "info", "text": msg_txt})
+                        else:
+                            err_txt = f"Allocator exited with code {res.returncode}: {res.stderr.strip()}"
+                            log.warning(err_txt)
+                            await self.send({"type": "error", "text": err_txt})
+                    except Exception as e:
+                        log.error("Failed executing allocator: %s", e)
+                        await self.send({"type": "error", "text": f"Failed adjusting cgroup: {e}"})
                 else:
                     log.warning("[Client #%d] Unrecognized message type '%s'", self.client_id, msg_type)
         finally:

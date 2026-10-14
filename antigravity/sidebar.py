@@ -8,13 +8,15 @@ import base64
 import json
 import socket
 import threading
+import subprocess
 from pathlib import Path
 from typing import Optional
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout,
     QTextEdit, QLineEdit, QLabel, QPushButton, QProgressBar,
-    QSystemTrayIcon, QMenu, QMessageBox, QFrame, QFileDialog
+    QSystemTrayIcon, QMenu, QMessageBox, QFrame, QFileDialog,
+    QDialog, QSlider
 )
 from PyQt6.QtGui import QAction, QDragEnterEvent, QDropEvent
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread, qInstallMessageHandler, QtMsgType
@@ -39,6 +41,70 @@ def _qt_message_handler(msg_type: QtMsgType, context, message: str):
         log.error("[Qt Critical] %s (file: %s:%s)", message, context.file, context.line)
     elif msg_type == QtMsgType.QtFatalMsg:
         log.critical("[Qt Fatal] %s (file: %s:%s)", message, context.file, context.line)
+
+# ── Dynamic Cgroups Resource Allocator Dialog ───────────
+
+class CgroupDialog(QDialog):
+    def __init__(self, parent=None, current_pct=70):
+        super().__init__(parent)
+        self.setWindowTitle("⚙ Cgroups v2 Resource Allocator")
+        self.setFixedSize(380, 240)
+        self.setStyleSheet("""
+            QDialog        { background: #161b22; color: #c9d1d9; font-family: 'Inter', 'Segoe UI', sans-serif; }
+            QLabel         { color: #c9d1d9; font-size: 12px; }
+            QLabel#header  { color: #58a6ff; font-size: 14px; font-weight: bold; }
+            QLabel#sub     { color: #8b949e; font-size: 11px; }
+            QSlider::groove:horizontal { height: 6px; background: #30363d; border-radius: 3px; }
+            QSlider::sub-page:horizontal { background: #238636; border-radius: 3px; }
+            QSlider::handle:horizontal { background: #58a6ff; width: 16px; margin-top: -5px; margin-bottom: -5px; border-radius: 8px; }
+            QPushButton    { background: #238636; border: none; border-radius: 6px; padding: 7px 14px; font-weight: 600; color: #ffffff; }
+            QPushButton:hover { background: #2ea043; }
+            QPushButton#cancel { background: #21262d; border: 1px solid #30363d; color: #8b949e; }
+            QPushButton#cancel:hover { background: #30363d; color: #c9d1d9; }
+        """)
+        self.target_pct = current_pct
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(12)
+
+        hdr = QLabel("⚛ Cgroups v2 RAM Allocator")
+        hdr.setObjectName("header")
+        layout.addWidget(hdr)
+
+        sub = QLabel("Dynamically adjust kernel memory ceiling for AI OS processes (/sys/fs/cgroup/nexus).")
+        sub.setObjectName("sub")
+        sub.setWordWrap(True)
+        layout.addWidget(sub)
+
+        self.val_label = QLabel(f"Limit: {self.target_pct}% of Host RAM")
+        self.val_label.setStyleSheet("color: #58a6ff; font-weight: bold; font-size: 13px;")
+        layout.addWidget(self.val_label)
+
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(20, 95)
+        self.slider.setValue(self.target_pct)
+        self.slider.setTickInterval(5)
+        self.slider.valueChanged.connect(self._on_slider_changed)
+        layout.addWidget(self.slider)
+
+        layout.addStretch()
+
+        btn_row = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setObjectName("cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(cancel_btn)
+
+        apply_btn = QPushButton("Apply Dynamic Limit")
+        apply_btn.clicked.connect(self.accept)
+        btn_row.addWidget(apply_btn)
+
+        layout.addLayout(btn_row)
+
+    def _on_slider_changed(self, val: int):
+        self.target_pct = val
+        self.val_label.setText(f"Limit: {val}% of Host RAM")
 
 # ── Socket Client (threaded) ────────────────────────────
 
@@ -80,21 +146,20 @@ class SocketClient(QThread):
                 buf += data
                 while b"\n" in buf:
                     line, buf = buf.split(b"\n", 1)
-                    line_str = line.decode().strip()
-                    if not line_str:
-                        continue
-                    try:
-                        msg = json.loads(line_str)
-                        log.debug("SocketClient incoming packet: %.120s", line_str)
-                        self.message_received.emit(msg)
-                    except json.JSONDecodeError as e:
-                        log.warning("SocketClient JSON parse error for packet: %s (%s)", line_str, e)
+                    if line.strip():
+                        try:
+                            msg = json.loads(line.decode())
+                            log.debug("SocketClient parsed incoming payload type: %s", msg.get("type"))
+                            self.message_received.emit(msg)
+                        except Exception as e:
+                            log.warning("SocketClient failed to parse JSON line: %s", e)
             except Exception as e:
-                log.warning("SocketClient recv loop exception: %s", e)
+                if self._running:
+                    log.error("SocketClient socket read error: %s", e, exc_info=True)
                 break
         self._running = False
-        log.info("SocketClient reader loop ended, emitting disconnected signal")
         self.disconnected.emit()
+        log.info("SocketClient reader thread terminated")
 
     def send(self, msg: dict):
         if self._sock and self._running:
@@ -131,8 +196,6 @@ class StatsWorker(QThread):
         except Exception as e:
             log.error("StatsWorker execution failed: %s", e, exc_info=True)
 
-
-
 # ── Sidebar Widget ───────────────────────────────────────
 
 class NexusSidebar(QWidget):
@@ -140,6 +203,7 @@ class NexusSidebar(QWidget):
         super().__init__()
         self.client = SocketClient()
         self.pending_image_path: Optional[str] = None
+        self.is_always_on_top = True
 
         self._setup_window()
         self._setup_ui()
@@ -148,18 +212,14 @@ class NexusSidebar(QWidget):
 
     def _setup_window(self):
         self.setWindowTitle("AI Native OS")
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.Tool
-        )
+        self._apply_window_flags()
         self.setAcceptDrops(True)
         screen_obj = QApplication.primaryScreen()
         if screen_obj is None:
-            self.setGeometry(0, 0, 440, 1080)
+            self.setGeometry(0, 0, 460, 1080)
         else:
             screen = screen_obj.geometry()
-            w = 440
+            w = 460
             self.setGeometry(screen.width() - w, 0, w, screen.height())
         self.setStyleSheet("""
             QWidget        { background: #0d1117; color: #c9d1d9; font-family: 'Inter', 'Segoe UI', 'Ubuntu', 'Sans-Serif'; }
@@ -173,6 +233,8 @@ class NexusSidebar(QWidget):
             QPushButton:hover { background: #2ea043; }
             QPushButton#secondary { background: #21262d; border: 1px solid #30363d; color: #8b949e; }
             QPushButton#secondary:hover { background: #30363d; color: #c9d1d9; }
+            QPushButton#os_btn { background: #1f2937; border: 1px solid #374151; color: #60a5fa; font-weight: bold; }
+            QPushButton#os_btn:hover { background: #374151; color: #93c5fd; }
             QPushButton#danger { background: #da3633; color: #ffffff; }
             QPushButton#danger:hover { background: #f85149; }
             QProgressBar   { background: #161b22; border: 1px solid #30363d; border-radius: 4px;
@@ -184,6 +246,23 @@ class NexusSidebar(QWidget):
             QLabel#status  { font-size: 10px; color: #8b949e; }
             QFrame#divider { background: #30363d; max-height: 1px; }
         """)
+
+    def _apply_window_flags(self):
+        flags = Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
+        if self.is_always_on_top:
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+        self.setWindowFlags(flags)
+
+    def _toggle_always_on_top(self):
+        self.is_always_on_top = not self.is_always_on_top
+        self._apply_window_flags()
+        self.show()
+        if self.is_always_on_top:
+            self.pin_btn.setText("📌")
+            self.pin_btn.setToolTip("Always on Top: ON (click to unpin)")
+        else:
+            self.pin_btn.setText("📍")
+            self.pin_btn.setToolTip("Always on Top: OFF (click to pin)")
 
     def _setup_ui(self):
         layout = QVBoxLayout()
@@ -206,11 +285,26 @@ class NexusSidebar(QWidget):
         self.conn_dot.setStyleSheet("color: #da3633;")
         title_row.addWidget(self.conn_dot)
 
-        hide_btn = QPushButton("—")
-        hide_btn.setObjectName("secondary")
-        hide_btn.setFixedSize(28, 28)
-        hide_btn.clicked.connect(self.hide)
-        title_row.addWidget(hide_btn)
+        self.pin_btn = QPushButton("📌")
+        self.pin_btn.setObjectName("secondary")
+        self.pin_btn.setFixedSize(28, 28)
+        self.pin_btn.setToolTip("Toggle Always on Top")
+        self.pin_btn.clicked.connect(self._toggle_always_on_top)
+        title_row.addWidget(self.pin_btn)
+
+        min_btn = QPushButton("—")
+        min_btn.setObjectName("secondary")
+        min_btn.setFixedSize(28, 28)
+        min_btn.setToolTip("Minimize Sidebar")
+        min_btn.clicked.connect(self.showMinimized)
+        title_row.addWidget(min_btn)
+
+        close_btn = QPushButton("✕")
+        close_btn.setObjectName("secondary")
+        close_btn.setFixedSize(28, 28)
+        close_btn.setToolTip("Hide to Tray")
+        close_btn.clicked.connect(self.hide)
+        title_row.addWidget(close_btn)
         layout.addLayout(title_row)
 
         # ── Live Telemetry / Stats Panel ──
@@ -223,11 +317,34 @@ class NexusSidebar(QWidget):
         self.mem_bar.setFormat("cgroup RAM: %p%")
         layout.addWidget(self.mem_bar)
 
+        # ── OS Workspace Action Launchers ──
+        os_row = QHBoxLayout()
+        
+        term_btn = QPushButton("📟 Terminal")
+        term_btn.setObjectName("os_btn")
+        term_btn.setToolTip("Open native Linux Bash terminal on desktop")
+        term_btn.clicked.connect(self._launch_terminal)
+        os_row.addWidget(term_btn)
+
+        files_btn = QPushButton("📁 Files")
+        files_btn.setObjectName("os_btn")
+        files_btn.setToolTip("Open Thunar Linux file manager on desktop")
+        files_btn.clicked.connect(self._launch_files)
+        os_row.addWidget(files_btn)
+
+        cgroup_btn = QPushButton("⚙ Allocator")
+        cgroup_btn.setObjectName("os_btn")
+        cgroup_btn.setToolTip("Open Cgroups v2 dynamic resource manager")
+        cgroup_btn.clicked.connect(self._open_cgroup_dialog)
+        os_row.addWidget(cgroup_btn)
+
+        layout.addLayout(os_row)
+
         div = QFrame()
         div.setObjectName("divider")
         layout.addWidget(div)
 
-        # ── Chat Area ──
+        # ── Chat & Output Area ──
         self.chat = QTextEdit()
         self.chat.setReadOnly(True)
         layout.addWidget(self.chat, stretch=1)
@@ -261,12 +378,11 @@ class NexusSidebar(QWidget):
         # ── User Input Row ──
         input_row = QHBoxLayout()
         self.input_field = QLineEdit()
-        self.input_field.setPlaceholderText("Ask Nexus or type command (drop image here)…")
+        self.input_field.setPlaceholderText("Ask AI OS, type /run <cmd>, or drop an image…")
         self.input_field.returnPressed.connect(self._on_send)
         input_row.addWidget(self.input_field)
 
-        send_btn = QPushButton("▶")
-        send_btn.setFixedSize(38, 38)
+        send_btn = QPushButton("Send")
         send_btn.clicked.connect(self._on_send)
         input_row.addWidget(send_btn)
         layout.addLayout(input_row)
@@ -274,28 +390,25 @@ class NexusSidebar(QWidget):
         self.setLayout(layout)
 
     def _setup_timers(self):
-        log.debug("Setting up sidebar telemetry and reconnection timers...")
-        self._stats_timer = QTimer(self)
-        self._stats_timer.timeout.connect(self._fetch_stats)
-        self._stats_timer.start(2000)
-        self.stats_worker = None
-        self._fetch_stats()
+        log.debug("Setting up background telemetry and watchdog timers...")
+        self.stats_thread: Optional[StatsWorker] = None
+        self.stats_timer = QTimer(self)
+        self.stats_timer.timeout.connect(self._request_stats)
+        self.stats_timer.start(2000)
 
-        # Reconnection watchdog timer
-        self._reconnect_timer = QTimer(self)
-        self._reconnect_timer.timeout.connect(self._check_connection)
-        self._reconnect_timer.start(4000)
-        log.info("Timers initialized (stats: 2000ms, watchdog: 4000ms)")
+        self.reconnect_timer = QTimer(self)
+        self.reconnect_timer.timeout.connect(self._check_connection)
+        self.reconnect_timer.start(3000)
 
-    def _fetch_stats(self):
-        if self.stats_worker is None or not self.stats_worker.isRunning():
-            self.stats_worker = StatsWorker()
-            self.stats_worker.stats_updated.connect(self._update_stats)
-            self.stats_worker.finished.connect(self.stats_worker.deleteLater)
-            self.stats_worker.start()
+    def _request_stats(self):
+        if self.stats_thread is not None and self.stats_thread.isRunning():
+            return
+        self.stats_thread = StatsWorker()
+        self.stats_thread.stats_updated.connect(self._update_stats)
+        self.stats_thread.start()
 
     def _connect_socket(self):
-        log.info("Connecting socket client signals and initiating connection...")
+        log.info("Connecting sidebar signals to socket client...")
         self.client.message_received.connect(self._on_agent_message)
         self.client.connected.connect(self._on_connected)
         self.client.disconnected.connect(self._on_disconnected)
@@ -315,6 +428,45 @@ class NexusSidebar(QWidget):
         log.info("Sidebar state changed: OFFLINE")
         self.conn_dot.setText("● Offline")
         self.conn_dot.setStyleSheet("color: #da3633;")
+
+    # ── OS Workspace Actions ─────────────────────────────
+
+    def _launch_terminal(self):
+        log.info("User requested terminal launch on desktop")
+        terms = ["xfce4-terminal", "tilix", "gnome-terminal", "x-terminal-emulator", "xterm"]
+        for t in terms:
+            try:
+                subprocess.Popen([t], env=os.environ)
+                self._append("OS", f"Launched terminal (<code>{t}</code>) on desktop.", "#58a6ff")
+                return
+            except FileNotFoundError:
+                continue
+        self._append("⚠ Notice", "No GUI terminal found. Install via: <code>sudo apt install -y xfce4-terminal</code>", "#f85149")
+
+    def _launch_files(self):
+        log.info("User requested file manager launch on desktop")
+        fms = ["thunar", "nautilus", "pcmanfm"]
+        for f in fms:
+            try:
+                subprocess.Popen([f, str(Path.home())], env=os.environ)
+                self._append("OS", f"Launched file manager (<code>{f}</code>) on desktop.", "#58a6ff")
+                return
+            except FileNotFoundError:
+                continue
+        try:
+            subprocess.Popen(["xdg-open", str(Path.home())], env=os.environ)
+            self._append("OS", "Launched file explorer via xdg-open.", "#58a6ff")
+        except Exception as e:
+            self._append("⚠ Notice", f"Could not launch file manager: {e}", "#f85149")
+
+    def _open_cgroup_dialog(self):
+        log.info("Opening Cgroup Allocator Dialog...")
+        dlg = CgroupDialog(self, current_pct=70)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            new_pct = dlg.target_pct
+            log.info("User requested new cgroup percentage: %d%%", new_pct)
+            self._append("Cgroups", f"Reallocating kernel memory ceiling to <b>{new_pct}%</b>...", "#58a6ff")
+            self.client.send({"type": "set_cgroup", "percent": new_pct})
 
     # ── Drag and Drop Support for Images ─────────────────
 
@@ -395,6 +547,14 @@ class NexusSidebar(QWidget):
             self._unlock_safeguard()
             self.input_field.clear()
             return
+
+        if text.startswith("/run ") or text.startswith("/sh "):
+            cmd = text.split(" ", 1)[1].strip()
+            if cmd:
+                self._append("You (Shell)", f"<code>{cmd}</code>", "#58a6ff")
+                self.client.send({"type": "direct_command", "command": cmd})
+                self.input_field.clear()
+                return
 
         display_text = text or "(Image query)"
         if self.pending_image_path:
@@ -479,12 +639,11 @@ class NexusSidebar(QWidget):
 
     def closeEvent(self, event):
         log.info("Sidebar closeEvent triggered. Shutting down worker threads and socket client.")
-        if self.stats_worker and self.stats_worker.isRunning():
-            self.stats_worker.quit()
-            self.stats_worker.wait(500)
+        if hasattr(self, "stats_thread") and self.stats_thread and self.stats_thread.isRunning():
+            self.stats_thread.quit()
+            self.stats_thread.wait(500)
         self.client.close()
         super().closeEvent(event)
-
 
 # ── System Tray & Main ───────────────────────────────────
 
@@ -511,6 +670,19 @@ def main():
         toggle_act.triggered.connect(lambda: sidebar.setVisible(not sidebar.isVisible()))
         menu.addAction(toggle_act)
 
+        term_act = QAction("Launch Terminal", menu)
+        term_act.triggered.connect(sidebar._launch_terminal)
+        menu.addAction(term_act)
+
+        files_act = QAction("Launch File Manager", menu)
+        files_act.triggered.connect(sidebar._launch_files)
+        menu.addAction(files_act)
+
+        cgroup_act = QAction("Resource Allocator", menu)
+        cgroup_act.triggered.connect(sidebar._open_cgroup_dialog)
+        menu.addAction(cgroup_act)
+
+        menu.addSeparator()
         quit_act = QAction("Quit", menu)
         quit_act.triggered.connect(app.quit)
         menu.addAction(quit_act)

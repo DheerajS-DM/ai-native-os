@@ -21,7 +21,7 @@ _LOG_FORMAT = (
 )
 _DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-_initialized_loggers = {}
+_LOG_INITIALIZED = {}
 _lock = threading.Lock()
 
 def get_logger(name: str, log_filename: Optional[str] = None) -> logging.Logger:
@@ -89,8 +89,6 @@ def get_logger(name: str, log_filename: Optional[str] = None) -> logging.Logger:
         _LOG_INITIALIZED[name] = True
         logger.debug("Logger '%s' initialized (Module log: %s, Master: %s)", name, mod_log_path, MASTER_LOG_FILE)
         return logger
-
-_LOG_INITIALIZED = {}
 
 def setup_global_exception_handler(component_name: str):
     """Install global crash hooks for unhandled exceptions and thread exceptions."""

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# start.sh — Quick-start developer script for AI Native OS
+# start.sh — Native WSLg launcher for AI Native OS
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$DIR"
 
@@ -17,15 +17,25 @@ log() {
 
 log "INFO" "=================================================="
 log "INFO" "  AI Native OS — by Dheeraj and Dhruv"
+log "INFO" "  Native WSLg Desktop Workspace Engine"
 log "INFO" "  Startup script initiated from: $DIR"
 log "INFO" "=================================================="
+
+# Ensure native WSLg display integration
+export DISPLAY="${DISPLAY:-:0}"
+export WAYLAND_DISPLAY="${WAYLAND_DISPLAY:-wayland-0}"
+if [ -d "/mnt/wslg/runtime-dir" ]; then
+    export XDG_RUNTIME_DIR="/mnt/wslg/runtime-dir"
+fi
+export GDK_BACKEND=x11,wayland
+export QT_QPA_PLATFORM=xcb
 
 # Environment diagnostics
 log "INFO" "Environment Diagnostics:"
 log "INFO" "  USER:        $USER (UID: $(id -u), GID: $(id -g))"
-log "INFO" "  DISPLAY:     ${DISPLAY:-<not set>}"
-log "INFO" "  WAYLAND:     ${WAYLAND_DISPLAY:-<not set>}"
-log "INFO" "  RUNTIME_DIR: ${XDG_RUNTIME_DIR:-<not set>}"
+log "INFO" "  DISPLAY:     $DISPLAY"
+log "INFO" "  WAYLAND:     $WAYLAND_DISPLAY"
+log "INFO" "  RUNTIME_DIR: $XDG_RUNTIME_DIR"
 log "INFO" "  PYTHON3:     $(which python3 2>/dev/null || echo 'not found') ($(python3 --version 2>&1 || true))"
 
 # Check for model files
@@ -45,6 +55,21 @@ if [ ! -f "$MODEL_FILE" ]; then
     exit 1
 fi
 log "INFO" "Found model file at $MODEL_FILE ($(du -h "$MODEL_FILE" | cut -f1))"
+
+# Compile and initialize Cgroups Allocator
+if [ ! -f "$DIR/allocator" ] || [ "$DIR/allocator.c" -nt "$DIR/allocator" ]; then
+    log "INFO" "Compiling Cgroups v2 allocator..."
+    gcc -O2 -Wall "$DIR/allocator.c" -o "$DIR/allocator" 2>&1 || log "WARNING" "Failed compiling allocator.c"
+fi
+
+if [ -f "$DIR/allocator" ]; then
+    log "INFO" "Initializing Cgroups v2 resource allocator (70% RAM ceiling)..."
+    if sudo -n true 2>/dev/null; then
+        sudo "$DIR/allocator" 70 >> "$START_LOG" 2>&1 || true
+    else
+        "$DIR/allocator" 70 >> "$START_LOG" 2>&1 || true
+    fi
+fi
 
 # Cgroup process attachment helper
 assign_cgroup() {
@@ -76,44 +101,50 @@ if [ -s "$MMPROJ_FILE" ]; then
     log "INFO" "Multimodal vision projector enabled: $MMPROJ_FILE ($(du -h "$MMPROJ_FILE" | cut -f1))"
 fi
 
-log "INFO" "[1/3] Starting Gemma-3n llama-server with CUDA acceleration..."
-"$LLAMA_BIN" \
-    --model "$MODEL_FILE" \
-    $MMPROJ_OPT \
-    --host 127.0.0.1 \
-    --port 8080 \
-    --ctx-size 8192 \
-    --threads 4 \
-    --n-gpu-layers 99 \
-    --metrics > /tmp/llama-server.log 2>&1 &
-LLAMA_PID=$!
-assign_cgroup "$LLAMA_PID" "llama-server"
-log "INFO" "llama-server launched in background (PID: $LLAMA_PID, log: /tmp/llama-server.log)"
+# Check if llama-server is already running
+if curl -s -m 1 http://127.0.0.1:8080/health >/dev/null 2>&1; then
+    log "INFO" "[1/3] llama-server is already running and healthy on http://127.0.0.1:8080"
+    LLAMA_PID=$(pgrep -f "llama-server" | head -n 1)
+else
+    log "INFO" "[1/3] Starting Gemma-3n llama-server with CUDA acceleration..."
+    "$LLAMA_BIN" \
+        --model "$MODEL_FILE" \
+        $MMPROJ_OPT \
+        --host 127.0.0.1 \
+        --port 8080 \
+        --ctx-size 8192 \
+        --threads 4 \
+        --n-gpu-layers 99 \
+        --metrics > /tmp/llama-server.log 2>&1 &
+    LLAMA_PID=$!
+    assign_cgroup "$LLAMA_PID" "llama-server"
+    log "INFO" "llama-server launched in background (PID: $LLAMA_PID, log: /tmp/llama-server.log)"
 
-# Wait for server health
-log "INFO" "Waiting for llama-server HTTP endpoint to become healthy..."
-HEALTHY=0
-for i in {1..35}; do
-    HEALTH_RESP=$(curl -s -m 2 http://127.0.0.1:8080/health 2>&1 || true)
-    METRICS_RESP=$(curl -s -m 2 http://127.0.0.1:8080/metrics 2>&1 || true)
-    if [ -n "$HEALTH_RESP" ] || [ -n "$METRICS_RESP" ]; then
-        log "INFO" "llama-server is healthy after ${i}s. (Health probe: ${HEALTH_RESP:-HTTP 200 OK})"
-        HEALTHY=1
-        break
-    fi
-    if ! kill -0 $LLAMA_PID 2>/dev/null; then
-        log "ERROR" "llama-server process died unexpectedly during startup. Log output:"
+    # Wait for server health
+    log "INFO" "Waiting for llama-server HTTP endpoint to become healthy..."
+    HEALTHY=0
+    for i in {1..35}; do
+        HEALTH_RESP=$(curl -s -m 2 http://127.0.0.1:8080/health 2>&1 || true)
+        METRICS_RESP=$(curl -s -m 2 http://127.0.0.1:8080/metrics 2>&1 || true)
+        if [ -n "$HEALTH_RESP" ] || [ -n "$METRICS_RESP" ]; then
+            log "INFO" "llama-server is healthy after ${i}s. (Health probe: ${HEALTH_RESP:-HTTP 200 OK})"
+            HEALTHY=1
+            break
+        fi
+        if ! kill -0 $LLAMA_PID 2>/dev/null; then
+            log "ERROR" "llama-server process died unexpectedly during startup. Log output:"
+            tail -n 30 /tmp/llama-server.log | while IFS= read -r line; do log "ERROR" "  $line"; done
+            exit 1
+        fi
+        sleep 1
+    done
+
+    if [ $HEALTHY -eq 0 ]; then
+        log "ERROR" "llama-server failed health probe after 35s. Terminating PID $LLAMA_PID."
         tail -n 30 /tmp/llama-server.log | while IFS= read -r line; do log "ERROR" "  $line"; done
+        kill $LLAMA_PID 2>/dev/null
         exit 1
     fi
-    sleep 1
-done
-
-if [ $HEALTHY -eq 0 ]; then
-    log "ERROR" "llama-server failed health probe after 35s. Terminating PID $LLAMA_PID."
-    tail -n 30 /tmp/llama-server.log | while IFS= read -r line; do log "ERROR" "  $line"; done
-    kill $LLAMA_PID 2>/dev/null
-    exit 1
 fi
 
 log "INFO" "[2/3] Starting Nexus agent socket server..."
@@ -144,25 +175,26 @@ if [ $SOCKET_READY -eq 0 ]; then
     exit 1
 fi
 
-log "INFO" "[3/3] Starting PyQt6 sidebar UI..."
+log "INFO" "[3/3] Starting PyQt6 sidebar UI on native desktop display ($DISPLAY)..."
 python3 sidebar.py >> "$START_LOG" 2>&1 &
 SIDEBAR_PID=$!
 assign_cgroup "$SIDEBAR_PID" "sidebar"
 log "INFO" "PyQt6 Sidebar process started (PID: $SIDEBAR_PID)"
 
 log "INFO" "--------------------------------------------------"
-log "INFO" "All Nexus components successfully started!"
-log "INFO" "  - llama-server: PID $LLAMA_PID"
+log "INFO" "AI Native OS Workspace successfully started!"
+log "INFO" "  - llama-server: PID ${LLAMA_PID:-<external>}"
 log "INFO" "  - socket_server: PID $AGENT_PID"
 log "INFO" "  - sidebar UI:    PID $SIDEBAR_PID"
-log "INFO" "Press Ctrl+C to terminate all services."
+log "INFO" "The AI Sidebar is now running on your desktop."
+log "INFO" "Press Ctrl+C to stop all services."
 log "INFO" "--------------------------------------------------"
 
 shutdown() {
-    log "INFO" "Shutdown signal caught! Terminating all background processes..."
-    kill $SIDEBAR_PID $AGENT_PID $LLAMA_PID 2>/dev/null || true
+    log "INFO" "Shutdown signal caught! Terminating background processes..."
+    kill $SIDEBAR_PID $AGENT_PID 2>/dev/null || true
     rm -f /tmp/nexus.sock 2>/dev/null
-    log "INFO" "Nexus services shutdown completed."
+    log "INFO" "AI Native OS session ended cleanly."
     exit 0
 }
 

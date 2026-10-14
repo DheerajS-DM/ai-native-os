@@ -31,7 +31,7 @@ model:
 	@[ -f "$(MMPROJ_PATH)" ] || wget -O $(MMPROJ_PATH) $(MMPROJ_URL)
 
 run: allocator
-	sudo ./allocator
+	sudo ./allocator 70
 	bash start.sh
 
 install:

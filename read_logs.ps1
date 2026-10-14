@@ -36,6 +36,15 @@ function Show-WSLLog {
     param([string]$Title, [string]$WSLPath)
     $null = wsl -d Debian -u root -- test -s "$WSLPath"
     $exists = ($LASTEXITCODE -eq 0)
+    if (-not $exists -and $WSLPath.Contains("/nexus/")) {
+        $alt = $WSLPath.Replace("/nexus/", "/antigravity/")
+        $null = wsl -d Debian -u root -- test -s "$alt"
+        if ($LASTEXITCODE -eq 0) { $WSLPath = $alt; $exists = $true }
+    } elseif (-not $exists -and $WSLPath.Contains("/antigravity/")) {
+        $alt = $WSLPath.Replace("/antigravity/", "/nexus/")
+        $null = wsl -d Debian -u root -- test -s "$alt"
+        if ($LASTEXITCODE -eq 0) { $WSLPath = $alt; $exists = $true }
+    }
     Show-Header $Title $WSLPath $exists
     if ($exists) {
         wsl -d Debian -u root -- tail -n $Lines "$WSLPath"
@@ -46,8 +55,8 @@ function Show-WSLLog {
 }
 
 if ($Follow) {
-    Show-Header "Live Tail: Antigravity Master Log" "~/.local/share/antigravity/logs/antigravity_master.log" $true
-    wsl -d Debian -u dheeraj -- bash -c "mkdir -p ~/.local/share/antigravity/logs && touch ~/.local/share/antigravity/logs/antigravity_master.log && tail -f ~/.local/share/antigravity/logs/antigravity_master.log"
+    Show-Header "Live Tail: AI Native OS Master Log" "~/.local/share/nexus/logs/nexus_master.log" $true
+    wsl -d Debian -u dheeraj -- bash -c "mkdir -p ~/.local/share/nexus/logs && touch ~/.local/share/nexus/logs/nexus_master.log && tail -f ~/.local/share/nexus/logs/nexus_master.log"
     exit 0
 }
 
